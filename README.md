@@ -221,6 +221,19 @@ bind=$mainMod,g,exec,hyprctl keyword cursor:inactive_timeout 0; hyprctl keyword 
 
 `wl-kbptr` can be configured with a configuration file. See [`config.example`](./config.example) for an example and run `wl-kbptr --help-config` for help.
 
+### Keeping popups and context menus open
+
+By default `wl-kbptr` takes the keyboard focus while it is displayed. Compositors dismiss open popups — context menus, dropdowns, etc. — when that happens, so they cannot be targeted.
+
+Setting `general.key_source` to `input_method` makes `wl-kbptr` grab the keyboard as an input method instead, which leaves the focus where it is:
+
+```ini
+[general]
+key_source=input_method
+```
+
+This needs the compositor to support the `input-method-unstable-v2` protocol and no other input method (e.g. fcitx5) to be running. Otherwise `wl-kbptr` falls back to taking the keyboard focus. So far this has only been tried on Hyprland.
+
 ## Dependencies
 
 - [`xkbcommon`](https://xkbcommon.org)

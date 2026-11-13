@@ -14,6 +14,7 @@
 #include "xdg-output-unstable-v1-client-protocol.h"
 
 #include <cairo/cairo.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
@@ -198,11 +199,8 @@ static void load_home_row(
     xkb_state_unref(xkb_state);
 }
 
-static void handle_keyboard_keymap(
-    void *data, struct wl_keyboard *keyboard, uint32_t format, int fd,
-    uint32_t size
-) {
-    struct seat *seat = data;
+static void
+seat_load_keymap(struct seat *seat, uint32_t format, int fd, uint32_t size) {
     if (seat->xkb_state != NULL) {
         xkb_state_unref(seat->xkb_state);
         seat->xkb_state = NULL;
@@ -245,11 +243,13 @@ static void handle_keyboard_keymap(
     seat->xkb_state = xkb_state_new(seat->xkb_keymap);
 }
 
-static void handle_keyboard_key(
-    void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
-    uint32_t key, uint32_t key_state
-) {
-    struct seat        *seat = data;
+static void
+seat_handle_key(struct seat *seat, uint32_t key, uint32_t key_state) {
+    if (seat->xkb_state == NULL ||
+        seat->state->current_mode == NO_MODE_ENTERED) {
+        return;
+    }
+
     char                text[64];
     const xkb_keycode_t key_code = key + 8;
     const xkb_keysym_t  key_sym =
@@ -266,14 +266,47 @@ static void handle_keyboard_key(
     }
 }
 
+static void seat_update_modifiers(
+    struct seat *seat, uint32_t mods_depressed, uint32_t mods_latched,
+    uint32_t mods_locked, uint32_t group
+) {
+    if (seat->xkb_state == NULL) {
+        return;
+    }
+
+    xkb_state_update_mask(
+        seat->xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group
+    );
+}
+
+static void handle_keyboard_keymap(
+    void *data, struct wl_keyboard *keyboard, uint32_t format, int fd,
+    uint32_t size
+) {
+    struct seat *seat = data;
+    if (seat->keyboard_grab != NULL) {
+        // The keymap, and the state that goes with it, come from the grab.
+        close(fd);
+        return;
+    }
+
+    seat_load_keymap(seat, format, fd, size);
+}
+
+static void handle_keyboard_key(
+    void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
+    uint32_t key, uint32_t key_state
+) {
+    seat_handle_key(data, key, key_state);
+}
+
 static void handle_keyboard_modifiers(
     void *data, struct wl_keyboard *keyboard, uint32_t serial,
     uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked,
     uint32_t group
 ) {
-    struct seat *seat = data;
-    xkb_state_update_mask(
-        seat->xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group
+    seat_update_modifiers(
+        data, mods_depressed, mods_latched, mods_locked, group
     );
 }
 
@@ -285,6 +318,243 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
     .modifiers   = handle_keyboard_modifiers,
     .repeat_info = noop,
 };
+
+/*
+ * Reading keys through an input method keyboard grab
+ * (`general.key_source=input_method`).
+ *
+ * Taking the keyboard focus makes the compositor dismiss open popups (context
+ * menus, dropdowns, ...) as they loose their grab. An input method can grab the
+ * keyboard instead: it then gets all the keys while the focus stays where it
+ * is.
+ *
+ * As the focused application no longer gets anything from the keyboard, what
+ * we don't consume and that it needs to keep its state right is passed on to
+ * it with a virtual keyboard, like an input method would do.
+ */
+
+static struct zwp_virtual_keyboard_v1 *
+seat_get_virtual_keyboard(struct seat *seat) {
+    if (seat->virtual_keyboard != NULL) {
+        return seat->virtual_keyboard;
+    }
+
+    if (seat->state->virtual_keyboard_mgr == NULL || seat->grab_keymap_fd < 0) {
+        return NULL;
+    }
+
+    seat->virtual_keyboard =
+        zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+            seat->state->virtual_keyboard_mgr, seat->wl_seat
+        );
+    zwp_virtual_keyboard_v1_keymap(
+        seat->virtual_keyboard, seat->grab_keymap_format, seat->grab_keymap_fd,
+        seat->grab_keymap_size
+    );
+
+    return seat->virtual_keyboard;
+}
+
+static void handle_grab_keymap(
+    void *data, struct zwp_input_method_keyboard_grab_v2 *grab, uint32_t format,
+    int32_t fd, uint32_t size
+) {
+    struct seat *seat = data;
+
+    // The keymap is kept as the virtual keyboard needs it.
+    if (seat->grab_keymap_fd >= 0) {
+        close(seat->grab_keymap_fd);
+        seat->grab_keymap_fd = -1;
+    }
+    if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        seat->grab_keymap_fd     = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        seat->grab_keymap_format = format;
+        seat->grab_keymap_size   = size;
+
+        if (seat->virtual_keyboard != NULL && seat->grab_keymap_fd >= 0) {
+            zwp_virtual_keyboard_v1_keymap(
+                seat->virtual_keyboard, format, seat->grab_keymap_fd, size
+            );
+        }
+    }
+
+    seat_load_keymap(seat, format, fd, size);
+}
+
+static void handle_grab_key(
+    void *data, struct zwp_input_method_keyboard_grab_v2 *grab, uint32_t serial,
+    uint32_t time, uint32_t key, uint32_t key_state
+) {
+    struct seat *seat = data;
+
+    if (key_state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        if (seat->grab_num_pressed_keys < MAX_GRAB_PRESSED_KEYS) {
+            seat->grab_pressed_keys[seat->grab_num_pressed_keys++] = key;
+        }
+    } else {
+        bool pressed_while_grabbed = false;
+        for (int i = 0; i < seat->grab_num_pressed_keys; i++) {
+            if (seat->grab_pressed_keys[i] == key) {
+                seat->grab_pressed_keys[i] =
+                    seat->grab_pressed_keys[--seat->grab_num_pressed_keys];
+                pressed_while_grabbed = true;
+                break;
+            }
+        }
+
+        if (!pressed_while_grabbed) {
+            // The key was already held down when the keyboard got grabbed,
+            // e.g. the modifier of the binding that started us. The focused
+            // application saw it being pressed so it has to see it being
+            // released.
+            struct zwp_virtual_keyboard_v1 *virtual_keyboard =
+                seat_get_virtual_keyboard(seat);
+            if (virtual_keyboard != NULL) {
+                zwp_virtual_keyboard_v1_key(
+                    virtual_keyboard, time, key, key_state
+                );
+            }
+            return;
+        }
+    }
+
+    seat_handle_key(seat, key, key_state);
+}
+
+static void handle_grab_modifiers(
+    void *data, struct zwp_input_method_keyboard_grab_v2 *grab, uint32_t serial,
+    uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked,
+    uint32_t group
+) {
+    struct seat   *seat    = data;
+    const uint32_t mods[4] = {mods_depressed, mods_latched, mods_locked, group};
+
+    // The first report is the state at the time of the grab, which the focused
+    // application already knows of. Changes are passed on, otherwise it would
+    // for instance keep on seeing the modifier of the binding that started us
+    // as held down.
+    if (seat->grab_has_mods &&
+        memcmp(mods, seat->grab_mods, sizeof(mods)) != 0) {
+        struct zwp_virtual_keyboard_v1 *virtual_keyboard =
+            seat_get_virtual_keyboard(seat);
+        if (virtual_keyboard != NULL) {
+            zwp_virtual_keyboard_v1_modifiers(
+                virtual_keyboard, mods_depressed, mods_latched, mods_locked,
+                group
+            );
+        }
+    }
+    seat->grab_has_mods = true;
+    memcpy(seat->grab_mods, mods, sizeof(mods));
+
+    seat_update_modifiers(
+        seat, mods_depressed, mods_latched, mods_locked, group
+    );
+}
+
+static const struct zwp_input_method_keyboard_grab_v2_listener
+    keyboard_grab_listener = {
+        .keymap      = handle_grab_keymap,
+        .key         = handle_grab_key,
+        .modifiers   = handle_grab_modifiers,
+        .repeat_info = noop,
+};
+
+static void handle_input_method_unavailable(
+    void *data, struct zwp_input_method_v2 *input_method
+) {
+    struct seat *seat              = data;
+    seat->input_method_unavailable = true;
+}
+
+static const struct zwp_input_method_v2_listener input_method_listener = {
+    .activate          = noop,
+    .deactivate        = noop,
+    .surrounding_text  = noop,
+    .text_change_cause = noop,
+    .content_type      = noop,
+    .done              = noop,
+    .unavailable       = handle_input_method_unavailable,
+};
+
+static void release_input_method_keyboards(struct state *state) {
+    struct seat *seat;
+    wl_list_for_each (seat, &state->seats, link) {
+        if (seat->keyboard_grab != NULL) {
+            zwp_input_method_keyboard_grab_v2_release(seat->keyboard_grab);
+            seat->keyboard_grab = NULL;
+        }
+        if (seat->virtual_keyboard != NULL) {
+            zwp_virtual_keyboard_v1_destroy(seat->virtual_keyboard);
+            seat->virtual_keyboard = NULL;
+        }
+        if (seat->input_method != NULL) {
+            zwp_input_method_v2_destroy(seat->input_method);
+            seat->input_method = NULL;
+        }
+        if (seat->grab_keymap_fd >= 0) {
+            close(seat->grab_keymap_fd);
+            seat->grab_keymap_fd = -1;
+        }
+    }
+
+    state->keys_from_input_method = false;
+}
+
+/**
+ * Grab the keyboards as an input method.
+ *
+ * Returns `false` if that is not possible, in which case keys have to be read
+ * from the `wl_keyboard`.
+ */
+static bool grab_input_method_keyboards(struct state *state) {
+    if (state->input_method_mgr == NULL) {
+        LOG_WARN(
+            "Compositor does not support `zwp_input_method_manager_v2`. "
+            "Falling back to `key_source=wayland`."
+        );
+        return false;
+    }
+
+    if (wl_list_empty(&state->seats)) {
+        return false;
+    }
+
+    struct seat *seat;
+    wl_list_for_each (seat, &state->seats, link) {
+        seat->input_method = zwp_input_method_manager_v2_get_input_method(
+            state->input_method_mgr, seat->wl_seat
+        );
+        zwp_input_method_v2_add_listener(
+            seat->input_method, &input_method_listener, seat
+        );
+
+        seat->keyboard_grab =
+            zwp_input_method_v2_grab_keyboard(seat->input_method);
+        zwp_input_method_keyboard_grab_v2_add_listener(
+            seat->keyboard_grab, &keyboard_grab_listener, seat
+        );
+    }
+
+    state->keys_from_input_method = true;
+
+    // There can only be one input method per seat. If there is one already,
+    // the compositor tells us that ours is unavailable.
+    wl_display_roundtrip(state->wl_display);
+
+    wl_list_for_each (seat, &state->seats, link) {
+        if (seat->input_method_unavailable) {
+            LOG_WARN(
+                "Another input method is already running. Falling back to "
+                "`key_source=wayland`."
+            );
+            release_input_method_keyboards(state);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static void handle_seat_capabilities(
     void *data, struct wl_seat *wl_seat, uint32_t capabilities
@@ -486,11 +756,12 @@ static void handle_registry_global(
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         struct seat *seat = calloc(1, sizeof(struct seat));
         seat->wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 7);
-        seat->wl_keyboard = NULL;
-        seat->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-        seat->xkb_state   = NULL;
-        seat->xkb_keymap  = NULL;
-        seat->state       = state;
+        seat->wl_keyboard    = NULL;
+        seat->xkb_context    = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        seat->xkb_state      = NULL;
+        seat->xkb_keymap     = NULL;
+        seat->state          = state;
+        seat->grab_keymap_fd = -1;
 
         wl_seat_add_listener(seat->wl_seat, &wl_seat_listener, seat);
         wl_list_insert(&state->seats, &seat->link);
@@ -524,6 +795,18 @@ static void handle_registry_global(
     ) {
         state->fractional_scale_mgr = wl_registry_bind(
             registry, name, &wp_fractional_scale_manager_v1_interface, 1
+        );
+    } else if (
+        strcmp(interface, zwp_input_method_manager_v2_interface.name) == 0
+    ) {
+        state->input_method_mgr = wl_registry_bind(
+            registry, name, &zwp_input_method_manager_v2_interface, 1
+        );
+    } else if (
+        strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0
+    ) {
+        state->virtual_keyboard_mgr = wl_registry_bind(
+            registry, name, &zwp_virtual_keyboard_manager_v1_interface, 1
         );
 #if OPENCV_ENABLED
     } else if (
@@ -675,12 +958,15 @@ int main(int argc, char **argv) {
 #if OPENCV_ENABLED
         .wl_screencopy_manager = NULL,
 #endif
-        .wp_viewporter        = NULL,
-        .fractional_scale_mgr = NULL,
-        .running              = true,
-        .fractional_scale     = 0,
-        .result               = (struct rect){-1, -1, -1, -1},
-        .initial_area         = (struct rect){-1, -1, -1, -1},
+        .input_method_mgr       = NULL,
+        .virtual_keyboard_mgr   = NULL,
+        .keys_from_input_method = false,
+        .wp_viewporter          = NULL,
+        .fractional_scale_mgr   = NULL,
+        .running                = true,
+        .fractional_scale       = 0,
+        .result                 = (struct rect){-1, -1, -1, -1},
+        .initial_area           = (struct rect){-1, -1, -1, -1},
         .home_row     = (char *[]){"", "", "", "", "", "", "", "", "", "", ""},
         .click        = CLICK_NONE,
         .drag         = false,
@@ -899,8 +1185,13 @@ int main(int argc, char **argv) {
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
     );
+    // Taking the keyboard focus makes the compositor dismiss open popups, so
+    // we don't when the keys come from an input method keyboard grab.
+    if (state.config.general.key_source == KEY_SOURCE_INPUT_METHOD) {
+        grab_input_method_keyboards(&state);
+    }
     zwlr_layer_surface_v1_set_keyboard_interactivity(
-        state.wl_layer_surface, true
+        state.wl_layer_surface, !state.keys_from_input_method
     );
 
     struct wp_fractional_scale_v1 *fractional_scale = NULL;
@@ -925,6 +1216,8 @@ int main(int argc, char **argv) {
     while (state.running && wl_display_dispatch(state.wl_display)) {}
 
     wp_viewport_destroy(state.wp_viewport);
+
+    release_input_method_keyboards(&state);
 
     zwlr_layer_surface_v1_destroy(state.wl_layer_surface);
     wl_surface_destroy(state.wl_surface);
@@ -966,6 +1259,13 @@ int main(int argc, char **argv) {
     if (state.fractional_scale_mgr) {
         wp_fractional_scale_v1_destroy(fractional_scale);
         wp_fractional_scale_manager_v1_destroy(state.fractional_scale_mgr);
+    }
+
+    if (state.input_method_mgr != NULL) {
+        zwp_input_method_manager_v2_destroy(state.input_method_mgr);
+    }
+    if (state.virtual_keyboard_mgr != NULL) {
+        zwp_virtual_keyboard_manager_v1_destroy(state.virtual_keyboard_mgr);
     }
 
     wp_viewporter_destroy(state.wp_viewporter);

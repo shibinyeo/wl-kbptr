@@ -276,6 +276,23 @@ static int parse_floating_mode_source_value(void *dest, char *value) {
     return 0;
 }
 
+static int parse_key_source(void *dest, char *value) {
+    enum key_source *out = dest;
+    if (strcmp(value, "wayland") == 0) {
+        *out = KEY_SOURCE_WAYLAND;
+    } else if (strcmp(value, "input_method") == 0) {
+        *out = KEY_SOURCE_INPUT_METHOD;
+    } else {
+        LOG_ERR(
+            "Invalid key source '%s'. Should be 'wayland' or 'input_method'.",
+            value
+        );
+        return 1;
+    }
+
+    return 0;
+}
+
 static int parse_click(void *dest, char *value) {
     enum click *out = dest;
     if (strcmp(value, "none") == 0) {
@@ -398,6 +415,16 @@ static struct section_def section_defs[] = {
         G_FIELD(
             cancellation_status_code, "0", parse_uint8, noop,
             "Status code to exit with when cancelled"
+        ),
+        G_FIELD(
+            key_source, "wayland", parse_key_source, noop,
+            "Where to read keys from (wayland or input_method).\n"
+            "`wayland` takes the keyboard focus, which makes the compositor "
+            "close open popups and menus.\n"
+            "`input_method` grabs the keyboard as an input method instead and "
+            "leaves the focus untouched, so popups and menus stay open. Falls "
+            "back to `wayland` if the compositor does not support it or "
+            "another input method (e.g. fcitx5) is already running."
         )
     ),
     SECTION(

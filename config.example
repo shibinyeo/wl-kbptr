@@ -16,6 +16,11 @@ modes=tile,bisect
 # Status code to exit with when cancelled
 cancellation_status_code=0
 
+# Where to read keys from (wayland or input_method).
+# `wayland` takes the keyboard focus, which makes the compositor close open popups and menus.
+# `input_method` grabs the keyboard as an input method instead and leaves the focus untouched, so popups and menus stay open. Falls back to `wayland` if the compositor does not support it or another input method (e.g. fcitx5) is already running.
+key_source=wayland
+
 
 ## Configuration for tile mode ##
 [mode_tile]

@@ -5,11 +5,13 @@
 
 #include "config.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "input-method-unstable-v2-client-protocol.h"
 #include "label.h"
 #include "screencopy.h"
 #include "surface_buffer.h"
 #include "utils.h"
 #include "viewporter-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
@@ -38,6 +40,10 @@
 
 #define MAX_NUM_MODES   3
 #define NO_MODE_ENTERED -1
+
+// Maximum number of keys tracked as held down while the keyboard is grabbed
+// through an input method.
+#define MAX_GRAB_PRESSED_KEYS 32
 
 struct mode_interface;
 
@@ -101,6 +107,26 @@ struct seat {
     struct xkb_keymap  *xkb_keymap;
     struct xkb_state   *xkb_state;
     struct state       *state;
+
+    // The fields below are only used with `general.key_source=input_method`.
+    struct zwp_input_method_v2               *input_method;
+    struct zwp_input_method_keyboard_grab_v2 *keyboard_grab;
+    bool                                      input_method_unavailable;
+
+    // Virtual keyboard used to pass on what we don't consume. It is created
+    // only once there is something to pass on.
+    struct zwp_virtual_keyboard_v1 *virtual_keyboard;
+    int                             grab_keymap_fd;
+    uint32_t                        grab_keymap_format;
+    uint32_t                        grab_keymap_size;
+
+    // Modifiers last reported by the grab.
+    bool     grab_has_mods;
+    uint32_t grab_mods[4];
+
+    // Keys pressed since the keyboard was grabbed.
+    uint32_t grab_pressed_keys[MAX_GRAB_PRESSED_KEYS];
+    int      grab_num_pressed_keys;
 };
 
 struct state {
@@ -122,26 +148,30 @@ struct state {
 #if OPENCV_ENABLED
     struct zwlr_screencopy_manager_v1 *wl_screencopy_manager;
 #endif
-    struct zxdg_output_manager_v1 *xdg_output_manager;
-    struct wl_list                 outputs;
-    struct wl_list                 seats;
-    struct output                 *current_output;
-    uint32_t                       surface_height;
-    uint32_t                       surface_width;
-    uint32_t                       fractional_scale; // scale / 120
-    bool                           running;
-    struct rect                    initial_area;
-    char                           home_row_buffer[HOME_ROW_BUFFER_LEN];
-    char                         **home_row;
-    struct rect                    result;
-    struct mode_interface         *mode_interfaces[MAX_NUM_MODES];
-    void                          *mode_states[MAX_NUM_MODES];
-    int                            current_mode;
-    enum click                     click;
-    bool                           drag;
-    int32_t                        drag_start_x;
-    int32_t                        drag_start_y;
-    int                            drag_phase;
+    struct zwp_input_method_manager_v2     *input_method_mgr;
+    struct zwp_virtual_keyboard_manager_v1 *virtual_keyboard_mgr;
+    // Keys are read from an input method keyboard grab, not from `wl_keyboard`.
+    bool                                    keys_from_input_method;
+    struct zxdg_output_manager_v1          *xdg_output_manager;
+    struct wl_list                          outputs;
+    struct wl_list                          seats;
+    struct output                          *current_output;
+    uint32_t                                surface_height;
+    uint32_t                                surface_width;
+    uint32_t                                fractional_scale; // scale / 120
+    bool                                    running;
+    struct rect                             initial_area;
+    char                   home_row_buffer[HOME_ROW_BUFFER_LEN];
+    char                 **home_row;
+    struct rect            result;
+    struct mode_interface *mode_interfaces[MAX_NUM_MODES];
+    void                  *mode_states[MAX_NUM_MODES];
+    int                    current_mode;
+    enum click             click;
+    bool                   drag;
+    int32_t                drag_start_x;
+    int32_t                drag_start_y;
+    int                    drag_phase;
 };
 
 #endif

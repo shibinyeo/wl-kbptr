@@ -23,6 +23,8 @@ client_protocols = [
   'wlr-virtual-pointer-unstable-v1.xml',
   'wlr-screencopy-unstable-v1.xml',
   'fractional-scale-v1.xml',
+  'input-method-unstable-v2.xml',
+  'virtual-keyboard-unstable-v1.xml',
 ]
 
 protos_src = []
